@@ -2,20 +2,34 @@
 """
 Network Scanner - Assignment 2
 
-Scans either:
-- a single host (e.g. 192.168.0.10)
-- a range (e.g. 192.168.0.1-49)
+Scans:
+- single host:  python scanner.py --host 192.168.0.10
+- range:        python scanner.py --range 192.168.0.1-49
 
-Collects per host:
-IP, MAC (best effort), open ports, service (nmap allowed), hostname, OS (nmap allowed)
+Collects per host (best effort):
+- IP
+- MAC (best effort via ARP cache; may be None)
+- Hostname (reverse DNS)
+- Open TCP ports (connect scan)
+- Service + OS via Nmap (OPTIONAL; only if nmap exists)
 """
+
+from __future__ import annotations
 
 import argparse
 import ipaddress
+import re
+import shutil
 import socket
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+
+# ----------------------------
+# Data models
+# ----------------------------
 
 @dataclass
 class PortInfo:
@@ -33,18 +47,30 @@ class HostInfo:
     open_ports: List[PortInfo] = field(default_factory=list)
 
 
+# ----------------------------
+# CLI parsing
+# ----------------------------
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Network scanner")
+    parser = argparse.ArgumentParser(description="Network Scanner (Assignment 2)")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--host", help="Single host IP (e.g. 192.168.0.10)")
     group.add_argument("--range", dest="ip_range", help="Range like 192.168.0.1-49")
-    parser.add_argument("--ports", default="1-1024", help="Port range, default 1-1024")
-    parser.add_argument("--timeout", type=float, default=0.5, help="Socket timeout seconds")
+
+    parser.add_argument("--ports", default="1-1024", help="Port range (default: 1-1024) or CSV (22,80,443)")
+    parser.add_argument("--timeout", type=float, default=0.5, help="Socket timeout in seconds (default: 0.5)")
+    parser.add_argument("--workers", type=int, default=200, help="Thread workers for port scan (default: 200)")
     return parser.parse_args()
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
+
 def expand_range(ip_range: str) -> List[str]:
-    # Supports: 192.168.0.1-49  (same /24)
+    """
+    Supports: 192.168.0.1-49  (same /24)
+    """
     left, right = ip_range.split("-")
     base = ".".join(left.split(".")[:-1])
     start = int(left.split(".")[-1])
@@ -53,12 +79,24 @@ def expand_range(ip_range: str) -> List[str]:
 
 
 def parse_ports(ports: str) -> List[int]:
-    # Supports "1-1024" or "22,80,443"
+    """
+    Supports "1-1024" or "22,80,443" or "80"
+    """
+    ports = ports.strip()
     if "," in ports:
-        return [int(p.strip()) for p in ports.split(",") if p.strip()]
+        out = []
+        for p in ports.split(","):
+            p = p.strip()
+            if p:
+                out.append(int(p))
+        return sorted(set(out))
     if "-" in ports:
         a, b = ports.split("-")
-        return list(range(int(a), int(b) + 1))
+        a_i = int(a.strip())
+        b_i = int(b.strip())
+        if a_i > b_i:
+            a_i, b_i = b_i, a_i
+        return list(range(a_i, b_i + 1))
     return [int(ports)]
 
 
@@ -69,59 +107,176 @@ def resolve_hostname(ip: str) -> Optional[str]:
         return None
 
 
+# ----------------------------
+# Discovery (no admin)
+# ----------------------------
+
 def is_host_up(ip: str, timeout: float) -> bool:
     """
-    TODO tomorrow:
-    - simplest: try TCP connect to a common port (e.g. 80/443/22) OR ICMP (needs admin)
-    - best: ARP discovery on local LAN (scapy) to get MAC too
+    Best-effort host discovery without admin rights:
+    Try TCP connect to common ports.
+    If connect succeeds OR connection refused -> host is reachable.
     """
-    return True  # placeholder
+    common_ports = [80, 443, 22, 445, 3389]
+    for port in common_ports:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                res = s.connect_ex((ip, port))
+                # 0=open, 10061=refused on Windows => host reachable
+                if res in (0, 10061):
+                    return True
+        except Exception:
+            continue
+    return False
 
 
-def get_mac(ip: str) -> Optional[str]:
+# ----------------------------
+# MAC address (best effort)
+# ----------------------------
+
+def get_mac_from_arp_cache(ip: str) -> Optional[str]:
     """
-    TODO tomorrow:
-    - If you use scapy ARP, you can fill this easily
-    - Otherwise leave as None (best effort)
+    Best-effort MAC lookup using Windows ARP cache.
+    Works only if the IP has been contacted recently (e.g. via is_host_up / port scan).
     """
+    try:
+        proc = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=5)
+        out = proc.stdout.lower()
+        ip_l = ip.lower()
+
+        # lines look like: "  192.168.0.10          aa-bb-cc-dd-ee-ff     dynamic"
+        for line in out.splitlines():
+            if ip_l in line:
+                m = re.search(r"([0-9a-f]{2}[-:]){5}[0-9a-f]{2}", line)
+                if m:
+                    return m.group(0)
+    except Exception:
+        pass
     return None
 
 
-def scan_tcp_ports(ip: str, ports: List[int], timeout: float) -> List[int]:
+# ----------------------------
+# Port scanning
+# ----------------------------
+
+def _check_port(ip: str, port: int, timeout: float) -> Optional[int]:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return port if s.connect_ex((ip, port)) == 0 else None
+    except Exception:
+        return None
+
+
+def scan_tcp_ports(ip: str, ports: List[int], timeout: float, workers: int) -> List[int]:
     """
-    TODO tomorrow:
-    - socket connect scan
+    TCP connect scan using threads for speed.
     """
-    return []
+    if not ports:
+        return []
+
+    max_workers = min(workers, max(1, len(ports)))
+    open_ports: List[int] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_check_port, ip, p, timeout) for p in ports]
+        for f in as_completed(futures):
+            p = f.result()
+            if p is not None:
+                open_ports.append(p)
+
+    open_ports.sort()
+    return open_ports
+
+
+# ----------------------------
+# Nmap (optional)
+# ----------------------------
+
+def find_nmap() -> Optional[str]:
+    """
+    Find nmap executable if installed/in PATH. Returns path or None.
+    """
+    p = shutil.which("nmap")
+    if p:
+        return p
+    return None
 
 
 def nmap_service_and_os(ip: str, open_ports: List[int]) -> Tuple[Optional[str], List[Tuple[int, str]]]:
     """
-    TODO tomorrow:
-    - use python-nmap OR subprocess calling nmap
-    - allowed for service + OS detection
-    Return: (os_guess, [(port, service_name), ...])
+    Optional: service + OS detection via Nmap.
+    If nmap is missing, returns (None, []) safely.
     """
-    return None, []
+    if not open_ports:
+        return None, []
 
+    nmap_path = find_nmap()
+    if not nmap_path:
+        return None, []
+
+    port_arg = ",".join(str(p) for p in open_ports)
+
+    # -sV: service/version detection
+    # -O : OS detection (may require privileges; if it fails, we still parse whatever we can)
+    cmd = [nmap_path, "-sV", "-O", "--osscan-guess", "-p", port_arg, ip]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        out = proc.stdout
+    except Exception:
+        return None, []
+
+    # OS guess (best effort)
+    os_guess = None
+    m = re.search(r"OS details:\s*(.+)", out)
+    if m:
+        os_guess = m.group(1).strip()
+    else:
+        m2 = re.search(r"Running:\s*(.+)", out)
+        if m2:
+            os_guess = m2.group(1).strip()
+
+    # Services: lines like "80/tcp open http ..."
+    service_map: List[Tuple[int, str]] = []
+    for line in out.splitlines():
+        m3 = re.match(r"^(\d+)\/tcp\s+open\s+([^\s]+)", line.strip())
+        if m3:
+            service_map.append((int(m3.group(1)), m3.group(2)))
+
+    return os_guess, service_map
+
+
+# ----------------------------
+# Output
+# ----------------------------
 
 def print_results(hosts: List[HostInfo]) -> None:
-    # Simple readable output
+    print("=" * 72)
+    print(f"Found hosts: {len(hosts)}")
+    print("=" * 72)
+
     for h in hosts:
-        print("=" * 60)
-        print(f"IP: {h.ip}")
-        print(f"MAC: {h.mac or '-'}")
+        print("-" * 72)
+        print(f"IP:       {h.ip}")
+        print(f"MAC:      {h.mac or '-'}")
         print(f"Hostname: {h.hostname or '-'}")
-        print(f"OS: {h.os or '-'}")
+        print(f"OS:       {h.os or '-'}")
+
         if not h.open_ports:
             print("Open ports: -")
         else:
             print("Open ports:")
             for p in h.open_ports:
-                svc = p.service or "-"
-                print(f"  - {p.proto}/{p.port}  {svc}")
-    print("=" * 60)
+                print(f"  - {p.proto}/{p.port:<5} {p.service or '-'}")
 
+    print("-" * 72)
+
+
+# ----------------------------
+# Main
+# ----------------------------
 
 def main() -> None:
     args = parse_args()
@@ -130,32 +285,34 @@ def main() -> None:
     targets = [args.host] if args.host else expand_range(args.ip_range)
 
     results: List[HostInfo] = []
+
     for ip in targets:
-        # skip invalid IPs quickly
         try:
             ipaddress.ip_address(ip)
         except ValueError:
             continue
 
-        # TODO tomorrow: real host-up check
         if not is_host_up(ip, args.timeout):
             continue
 
         host = HostInfo(ip=ip)
         host.hostname = resolve_hostname(ip)
-        host.mac = get_mac(ip)
 
-        open_ports = scan_tcp_ports(ip, ports, args.timeout)
+        open_ports = scan_tcp_ports(ip, ports, args.timeout, args.workers)
+
+        # After contacting host, ARP cache may contain MAC
+        host.mac = get_mac_from_arp_cache(ip)
+
         os_guess, svc_map = nmap_service_and_os(ip, open_ports)
-
         host.os = os_guess
+
         for port in open_ports:
-            svc = None
+            service = None
             for prt, name in svc_map:
                 if prt == port:
-                    svc = name
+                    service = name
                     break
-            host.open_ports.append(PortInfo(port=port, service=svc))
+            host.open_ports.append(PortInfo(port=port, service=service))
 
         results.append(host)
 
