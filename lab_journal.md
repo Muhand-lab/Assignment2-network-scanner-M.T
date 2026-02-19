@@ -4,91 +4,157 @@
 
 \## 1. Use case
 
-Ik moet een netwerk scannen om apparaten te ontdekken en per apparaat basisinformatie te verzamelen
+The goal of this tool is to discover devices in a target network range and collect basic information per device
 
-(IP, MAC, poorten, services, hostname, OS) zodat ik een netwerk kan mappen.
+(IP address, MAC address, open ports, service names, hostname, and OS guess). This helps create a simple network map.
 
 
 
-\## 2. Netwerkinstelling (morgen invullen)
+The user interacts with the tool through the command line:
 
-\- Datum/tijd:
+\- Scan a single host: python scanner.py --host <ip>
 
-\- Aangesloten op: D2.60 / D2.70
+\- Scan a range: python scanner.py --range <start-end>
 
-\- Mijn IP (DHCP):
 
-\- Target range: 192.168.0.1 – 192.168.0.49
 
-\- Niet scannen: 192.168.0.50 – 192.168.0.250
+Optional parameters:
+
+\- --ports (e.g. 1-1024 or 22,80,443)
+
+\- --timeout (socket timeout)
+
+
+
+\## 2. Network setup
+
+\- Date/time: [19-02-2026]  / 12:49
+
+\- Connected to: D2.60 / D2.70 \[CHOOSE ONE]
+
+\- My IP (DHCP): 192.168.0.125
+
+\- Target range to scan: 192.168.0.1 – 192.168.0.49
+
+\- Note: IPs in 192.168.0.50 – 192.168.0.250 do not need to be scanned.
 
 
 
 \## 3. Pseudocode
 
-1\) Parse arguments:
+1\) Read command-line arguments (host or range, ports, timeout)
 
-&nbsp;  - single host OR IP range/subnet
+2\) Create a list of target IPs (single host OR expand range)
 
-2\) Host discovery:
+3\) For each target IP:
 
-&nbsp;  - Ping/ARP sweep om live hosts te vinden
+&nbsp;  - Check if the host is reachable (TCP connect check to common ports)
 
-&nbsp;  - Verzamel IP + (indien mogelijk) MAC
+&nbsp;  - If reachable:
 
-3\) Per live host:
+&nbsp;      - Resolve hostname (reverse DNS)
 
-&nbsp;  - Hostname lookup (reverse DNS)
+&nbsp;      - Scan TCP ports (connect scan)
 
-&nbsp;  - Port scan (bv. top ports of 1–1024)
+&nbsp;      - Try to get MAC address from ARP cache (best effort)
 
-&nbsp;  - Service detection (nmap toegestaan)
+&nbsp;      - If Nmap is available:
 
-&nbsp;  - OS detection (nmap toegestaan)
+&nbsp;          - Detect service names and OS guess
 
-4\) Print output netjes (tabel) en sla eventueel op (JSON/CSV)
+4\) Print results in a readable format and save output to a file
 
-5\) Error handling + timeouts
-
-
-
-\## 4. Testplan (morgen invullen)
-
-\- Test 1: single host scan
-
-\- Test 2: range scan 192.168.0.1–49
-
-\- Verwacht: meerdere hosts + open poorten + services/OS waar mogelijk
+5\) Handle errors and timeouts without crashing
 
 
 
-\## 5. Resultaten (morgen invullen)
+\## 4. Test plan
 
-\### Live hosts
+\- Test 1: Single host scan (e.g. --host 192.168.0.1)
 
-(plak hier output / screenshot)
+\- Test 2: Range scan 192.168.0.1–49
 
-
-
-\### Per host details
-
-(plak hier output / screenshot)
+\- Expected: multiple hosts, open ports, and service/OS information where possible
 
 
 
-\## 6. Problemen \& oplossingen (morgen invullen)
-
-\- Probleem:
-
-\- Oplossing:
+\## 5. Results
 
 
 
-\## 7. Reflectie (vraag uit opdracht)
+\### Command used
 
-Kwam de implementatie overeen met de pseudocode?
+python scanner.py --range 192.168.0.1-49 --ports 1-1024 --timeout 0.5 > scan\_output.txt
 
-\- Ja/nee + uitleg waarom (wat moest je aanpassen en waarom?)
+
+
+\### Summary
+
+\- Found hosts: 3 (within 192.168.0.1–49)
+
+
+
+\### Example results (excerpt)
+
+
+
+\*\*Host 1\*\*
+
+\- IP: 192.168.0.1
+
+\- MAC: b8-ca-3a-92-b1-e6
+
+\- Hostname: -
+
+\- OS: -
+
+\- Open ports/services: 22/ssh, 80/http
+
+
+
+\*\*Host 2\*\*
+
+\- IP: 192.168.0.4
+
+\- MAC: b8-ca-3a-92-bd-05
+
+\- Hostname: -
+
+\- OS guess: Linux 4.15 - 5.19
+
+\- Open ports/services: 25/smtp, 143/imap, 993/ssl-imap
+
+
+
+\*\*Host 3\*\*
+
+\- IP: \[PASTE FROM scan\_output.txt]
+
+\- MAC: \[PASTE FROM scan\_output.txt]
+
+\- Hostname: \[PASTE FROM scan\_output.txt OR '-']
+
+\- OS: \[PASTE FROM scan\_output.txt OR '-']
+
+\- Open ports/services: \[PASTE FROM scan\_output.txt]
+
+
+
+(Full output is stored in scan\_output.txt)
+
+
+
+\## 6. Problems \& solutions
+
+\- Problem: Ethernet was not set to DHCP, so the laptop did not receive a correct IP address for the lab network.
+
+\- Solution: Changed IPv4 settings to “Obtain an IP address automatically” (DHCP) and renewed the lease.
+
+
+
+\## 7. Reflection
+
+The implementation mostly matches the pseudocode. In practice, host discovery was done using a TCP connect check to common ports (no admin rights required) instead of ICMP ping. Service/OS detection is only executed when Nmap is available; if not, the scanner shows '-' and continues without crashing.
 
 
 
